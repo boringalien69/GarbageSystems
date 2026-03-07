@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude wallet key files from backup for security -->
+    <exclude domain="sharedpref" path="gs_secure.xml" />
+    <exclude domain="file" path="models/" />
+</full-backup-content>

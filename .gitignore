@@ -1,0 +1,22 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Model files (too large for git)
+*.gguf
+*.bin
+
+# APK outputs
+*.apk
+*.aab
+
+# Keystore (never commit)
+*.jks
+*.keystore
