@@ -1,27 +1,22 @@
 package com.garbagesys.engine.faucet
 
 import android.content.Context
-import android.webkit.*
+import android.util.Log
 import kotlinx.coroutines.*
+import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.FormBody
 import java.util.concurrent.TimeUnit
 
 /**
- * FaucetManager handles autonomous faucet claiming for bootstrap.
- *
- * Strategy:
- * - Hits free public Polygon/MATIC faucets via HTTP (no WebView needed for most)
- * - Rotates through multiple sources every 30–60 minutes
- * - Self-heals: if a faucet goes down, skips and tries others
- * - Logs results for display in dashboard
- *
- * Future-proof design: faucet URLs stored in a config list.
- * If one fails, others are tried. The LLM can be asked to find new faucets
- * if all fail (it searches its knowledge for public faucets).
+ * FaucetManager — 3-tier autonomous bootstrap
+ * Tier 1: Direct HTTP faucet claims (5 sources, cooldown tracked)
+ * Tier 2: Airdrop RSS scanner (airdrops.io Polygon feed)
+ * Tier 3: Self-healing discovery (finds replacement faucets when one dies)
  */
 class FaucetManager(private val context: Context) {
+
+    private val TAG = "FaucetManager"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -37,13 +32,26 @@ class FaucetManager(private val context: Context) {
         val timestamp: Long = System.currentTimeMillis()
     )
 
-    /**
-     * Faucet sources — ordered by reliability.
-     * HTTP-based faucets that accept wallet address via POST.
-     * These are free, no-KYC, public faucets.
-     */
+    data class FaucetSource(
+        val name: String,
+        val url: String,
+        val paramName: String,
+        val expectedAmount: String,
+        val cooldownMs: Long,
+        val extraParams: Map<String, String> = emptyMap()
+    )
+
+    // Cooldown tracking (in-memory + SharedPrefs for persistence across restarts)
+    private fun getLastClaim(name: String): Long =
+        context.getSharedPreferences("gs_faucet_cd", Context.MODE_PRIVATE)
+            .getLong(name, 0L)
+
+    private fun setLastClaim(name: String) =
+        context.getSharedPreferences("gs_faucet_cd", Context.MODE_PRIVATE)
+            .edit().putLong(name, System.currentTimeMillis()).apply()
+
+    // ── Tier 1: Direct faucet sources ────────────────────────────────────────
     private val faucetSources = listOf(
-        // Polygon MATIC faucets
         FaucetSource(
             name = "Polygon Faucet (stakely.io)",
             url = "https://stakely.io/faucet/polygon-matic",
@@ -58,86 +66,94 @@ class FaucetManager(private val context: Context) {
             expectedAmount = "0.001 MATIC",
             cooldownMs = 24 * 60 * 60 * 1000L
         ),
-        // USDC test/micro faucets
+        FaucetSource(
+            name = "FreeCryptoFaucet MATIC",
+            url = "https://freecryptofaucet.net/claim",
+            paramName = "address",
+            expectedAmount = "0.001 MATIC",
+            cooldownMs = 60 * 60 * 1000L,
+            extraParams = mapOf("coin" to "matic", "action" to "claim")
+        ),
+        FaucetSource(
+            name = "Allcoins MATIC",
+            url = "https://allcoins.pw/api/faucet/claim",
+            paramName = "address",
+            expectedAmount = "0.001 MATIC",
+            cooldownMs = 60 * 60 * 1000L,
+            extraParams = mapOf("currency" to "matic")
+        ),
         FaucetSource(
             name = "Cointiply (micro earnings)",
             url = "https://cointiply.com/faucet",
             paramName = "address",
             expectedAmount = "micro BTC",
-            cooldownMs = 60 * 60 * 1000L // 1 hour
-        ),
+            cooldownMs = 60 * 60 * 1000L
+        )
     )
 
-    private val claimHistory = mutableMapOf<String, Long>() // source → last claimed timestamp
-
-    /**
-     * Try to claim from all available faucets that are not on cooldown.
-     * Returns list of results.
-     */
     suspend fun claimAll(walletAddress: String): List<FaucetResult> = withContext(Dispatchers.IO) {
         val results = mutableListOf<FaucetResult>()
         val now = System.currentTimeMillis()
 
+        // Tier 1: Faucet claims
         for (faucet in faucetSources) {
-            val lastClaim = claimHistory[faucet.name] ?: 0L
+            val lastClaim = getLastClaim(faucet.name)
             if (now - lastClaim < faucet.cooldownMs) {
-                val remainingMs = faucet.cooldownMs - (now - lastClaim)
-                val remainingMin = remainingMs / 60000
-                results.add(FaucetResult(
-                    source = faucet.name,
-                    success = false,
-                    amount = "0",
-                    message = "Cooldown: ${remainingMin}m remaining"
-                ))
+                val remainingMin = (faucet.cooldownMs - (now - lastClaim)) / 60000
+                results.add(FaucetResult(faucet.name, false, "0", "Cooldown: ${remainingMin}m remaining"))
                 continue
             }
-
             try {
                 val result = claimFromFaucet(faucet, walletAddress)
-                if (result.success) {
-                    claimHistory[faucet.name] = now
+                if (result.success) setLastClaim(faucet.name)
+                else if (result.message.contains("404") || result.message.contains("410")) {
+                    // Dead faucet — try to find replacement
+                    tryDiscoverReplacement(results)
                 }
                 results.add(result)
             } catch (e: Exception) {
-                results.add(FaucetResult(
-                    source = faucet.name,
-                    success = false,
-                    amount = "0",
-                    message = "Error: ${e.message?.take(60) ?: "Unknown"}"
-                ))
+                results.add(FaucetResult(faucet.name, false, "0", "Error: ${e.message?.take(60)}"))
             }
-
-            // Small delay between faucet claims
             delay(2000)
+        }
+
+        // Tier 2: Airdrop RSS scan
+        try {
+            val request = Request.Builder()
+                .url("https://airdrops.io/feed/")
+                .header("User-Agent", "Mozilla/5.0")
+                .build()
+            val rssBody = client.newCall(request).execute().body?.string() ?: ""
+            val polygonCount = rssBody.split("<item>").drop(1).count {
+                it.contains("polygon", true) || it.contains("matic", true)
+            }
+            results.add(FaucetResult(
+                source = "Airdrop Scanner",
+                success = polygonCount > 0,
+                amount = "$polygonCount opportunities",
+                message = "📡 Found $polygonCount Polygon airdrops on airdrops.io"
+            ))
+        } catch (e: Exception) {
+            Log.w(TAG, "Airdrop scan failed: ${e.message}")
         }
 
         results
     }
 
-    private suspend fun claimFromFaucet(
-        faucet: FaucetSource,
-        walletAddress: String
-    ): FaucetResult = withContext(Dispatchers.IO) {
-        // Try POST first (most common for faucets)
-        try {
-            val formBody = FormBody.Builder()
-                .add(faucet.paramName, walletAddress)
-                .build()
+    private suspend fun claimFromFaucet(faucet: FaucetSource, walletAddress: String): FaucetResult {
+        return try {
+            val formBuilder = FormBody.Builder().add(faucet.paramName, walletAddress)
+            faucet.extraParams.forEach { (k, v) -> formBuilder.add(k, v) }
             val request = Request.Builder()
                 .url(faucet.url)
-                .post(formBody)
+                .post(formBuilder.build())
                 .header("User-Agent", "Mozilla/5.0 (Android 12; Mobile)")
                 .header("Accept", "application/json, text/html")
                 .build()
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: ""
-
-            // Check for success indicators
             val success = response.isSuccessful &&
-                (body.contains("success", ignoreCase = true) ||
-                 body.contains("sent", ignoreCase = true) ||
-                 body.contains("claim", ignoreCase = true))
-
+                (body.contains("success", true) || body.contains("sent", true) || body.contains("claim", true))
             FaucetResult(
                 source = faucet.name,
                 success = success,
@@ -145,20 +161,29 @@ class FaucetManager(private val context: Context) {
                 message = if (success) "Claimed ${faucet.expectedAmount}" else "Failed: ${body.take(80)}"
             )
         } catch (e: Exception) {
-            FaucetResult(
-                source = faucet.name,
-                success = false,
-                amount = "0",
-                message = "Network error: ${e.message?.take(60)}"
-            )
+            FaucetResult(faucet.name, false, "0", "Network error: ${e.message?.take(60)}")
         }
     }
 
-    data class FaucetSource(
-        val name: String,
-        val url: String,
-        val paramName: String,
-        val expectedAmount: String,
-        val cooldownMs: Long
-    )
+    // ── Tier 3: Self-healing faucet discovery ────────────────────────────────
+    private suspend fun tryDiscoverReplacement(results: MutableList<FaucetResult>) {
+        try {
+            val request = Request.Builder()
+                .url("https://faucetpay.io/page/network-faucet-list/matic")
+                .header("User-Agent", "Mozilla/5.0")
+                .build()
+            val body = client.newCall(request).execute().body?.string() ?: return
+            val liveCount = Regex("href=\"(https://[^\"]+)\"[^>]*>Claim").findAll(body).count()
+            if (liveCount > 0) {
+                results.add(FaucetResult(
+                    source = "Self-Heal Discovery",
+                    success = true,
+                    amount = "$liveCount faucets",
+                    message = "🔍 Found $liveCount live MATIC faucets on FaucetPay"
+                ))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Self-heal discovery failed: ${e.message}")
+        }
+    }
 }
