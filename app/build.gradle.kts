@@ -94,11 +94,11 @@ dependencies {
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // ── Web3j Android (Polygon/EVM wallet) ──
-    implementation("org.web3j:core:4.9.8-android")
+    implementation("org.web3j:core:4.9.4")
 
     // ── llama.cpp Android binding (local LLM inference) ──
     // Using the SmolChat / llmedge approach via JNI prebuilt .so
-    implementation("com.github.Aatricks:llmedge:0.1.2")
+    // llmedge placeholder
 
     // ── Security / Keystore ──
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
