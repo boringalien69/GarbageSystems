@@ -3,12 +3,13 @@ package com.garbagesys.engine.agent
 import android.content.Context
 import android.util.Log
 import com.garbagesys.data.db.PreferencesRepository
+import com.garbagesys.data.models.*
 import com.garbagesys.engine.faucet.FaucetManager
 import com.garbagesys.engine.llm.LlmEngine
 import com.garbagesys.engine.strategies.*
 import com.garbagesys.engine.wallet.WalletManager
 import kotlinx.coroutines.*
-import org.json.JSONObject
+import kotlinx.coroutines.flow.firstOrNull
 
 class AgentOrchestrator(private val context: Context) {
     private val TAG = "AgentOrchestrator"
@@ -16,129 +17,140 @@ class AgentOrchestrator(private val context: Context) {
     private val walletManager = WalletManager(context)
     private val llmEngine = LlmEngine(context)
     private val faucetManager = FaucetManager(context, prefs)
-    private val polymarketClient = PolymarketClient()
-    private val weatherStrategy = WeatherStrategy(polymarketClient)
-    private val whaleCopyStrategy = WhaleCopyStrategy(polymarketClient)
-    private val crowdContraStrategy = CrowdContraStrategy(polymarketClient)
-    private val latencyArbStrategy = LatencyArbStrategy(polymarketClient)
 
-    suspend fun runCycle(): CycleResult = withContext(Dispatchers.IO) {
+    suspend fun runCycle() = withContext(Dispatchers.IO) {
         val logs = mutableListOf<String>()
-        var tradesExecuted = 0
-        var cycleEarnings = 0.0
         try {
             logs.add("🔄 Starting agent cycle...")
-            if (!prefs.isSetupComplete()) {
+
+            // Check setup complete
+            val setupState = prefs.setupStateFlow.firstOrNull() ?: AppSetupState()
+            if (!setupState.isInitialized) {
                 logs.add("⏳ Setup not complete. Skipping cycle.")
-                return@withContext CycleResult(false, 0.0, 0, logs)
+                saveLogs(logs); return@withContext
             }
-            val walletAddress = prefs.getWalletAddress()
-            if (walletAddress.isEmpty()) {
-                logs.add("⚠️ No wallet address found")
-                return@withContext CycleResult(false, 0.0, 0, logs)
-            }
-            val usdcBalance = try { walletManager.getUsdcBalance(walletAddress) } catch (e: Exception) { logs.add("⚠️ Balance check failed: ${e.message?.take(40)}"); 0.0 }
-            val maticBalance = try { walletManager.getMaticBalance(walletAddress) } catch (e: Exception) { 0.0 }
+
+            // Get credentials + wallet state
+            val credentials = walletManager.getOrCreateWallet()
+            walletManager.refreshWalletState(credentials)
+            val walletState = prefs.walletStateFlow.firstOrNull() ?: WalletState()
+            val usdcBalance = walletState.usdcBalance
+            val maticBalance = walletState.maticBalance
+
             logs.add("💰 Balance: $${String.format("%.4f", usdcBalance)} USDC, ${String.format("%.4f", maticBalance)} MATIC")
 
+            // Bootstrap if low
             if (usdcBalance < 1.0) {
-                logs.add("🥾 Balance low. Running 3-tier bootstrap...")
-                logs.addAll(faucetManager.runBootstrap(walletAddress))
+                val bootstrapLogs = faucetManager.runBootstrap(credentials.address)
+                logs.addAll(bootstrapLogs)
             }
 
+            // Need gas to trade
             if (maticBalance < 0.001 && usdcBalance < 0.5) {
                 logs.add("⛽ Insufficient gas. Waiting for bootstrap...")
-                prefs.setLastCycle(System.currentTimeMillis())
-                for (log in logs) prefs.addAgentLog(log)
-                return@withContext CycleResult(true, 0.0, 0, logs)
+                saveLogs(logs); return@withContext
             }
 
+            // Load strategy configs
+            val configs = prefs.strategyConfigsFlow.firstOrNull() ?: AllStrategyConfigs()
+
+            // Run strategies in parallel
             logs.add("📊 Scanning markets for signals...")
-            val signals = mutableListOf<TradeSignal>()
+            val signals = mutableListOf<MarketSignal>()
             listOf(
-                async { runCatching { weatherStrategy.analyze() }.getOrNull() ?: emptyList() },
-                async { runCatching { whaleCopyStrategy.analyze() }.getOrNull() ?: emptyList() },
-                async { runCatching { crowdContraStrategy.analyze() }.getOrNull() ?: emptyList() },
-                async { runCatching { latencyArbStrategy.analyze() }.getOrNull() ?: emptyList() }
+                async { runCatching { WeatherStrategy(polymarketClient(), configs.weather).findSignals(usdcBalance) }.getOrNull() ?: emptyList() },
+                async { runCatching { WhaleCopyStrategy(polymarketClient(), configs.whaleCopy).findSignals(usdcBalance) }.getOrNull() ?: emptyList() },
+                async { runCatching { CrowdContraStrategy(polymarketClient(), configs.crowdContra).findSignals(usdcBalance) }.getOrNull() ?: emptyList() },
+                async { runCatching { LatencyArbStrategy(polymarketClient(), configs.latencyArb).findSignals(usdcBalance) }.getOrNull() ?: emptyList() }
             ).awaitAll().forEach { signals.addAll(it) }
 
-            val topSignals = signals.filter { it.expectedValue > 0.03 }.sortedByDescending { it.expectedValue }.take(5)
+            val topSignals = signals.filter { it.edge > 0.03 }.sortedByDescending { it.edge }.take(5)
             logs.add("📈 Found ${topSignals.size} potential signals")
 
             if (topSignals.isEmpty()) {
                 logs.add("😴 No actionable signals this cycle")
             } else {
-                val approvedSignals = mutableListOf<TradeSignal>()
+                val approved = mutableListOf<MarketSignal>()
                 for (signal in topSignals.take(3)) {
                     try {
                         val decision = llmEngine.decide(
-                            "Market: ${signal.marketQuestion}\nStrategy: ${signal.strategy}\nEdge: ${String.format("%.1f", signal.expectedValue * 100)}%\nConfidence: ${String.format("%.1f", signal.confidence * 100)}%\nBalance: $usdcBalance",
+                            "Market: ${signal.question}\nStrategy: ${signal.strategy}\nEdge: ${String.format("%.1f", signal.edge * 100)}%\nConfidence: ${String.format("%.1f", signal.confidence * 100)}%",
                             "Should we place this trade?"
                         )
                         if (decision.verdict == "YES" && decision.confidence >= 0.6) {
-                            approvedSignals.add(signal)
-                            logs.add("✅ Approved: ${signal.marketQuestion.take(40)}")
+                            approved.add(signal)
+                            logs.add("✅ Approved: ${signal.question.take(50)}")
                         } else {
-                            logs.add("⏭️ Skipped: ${signal.marketQuestion.take(40)}")
+                            logs.add("⏭️ Skipped: ${signal.question.take(40)} — ${decision.reasoning.take(30)}")
                         }
                     } catch (e: Exception) {
-                        if (signal.confidence > 0.7 && signal.expectedValue > 0.05) {
-                            approvedSignals.add(signal)
-                            logs.add("✅ Strategy approved (LLM offline): ${signal.marketQuestion.take(40)}")
-                        }
+                        if (signal.confidence > 0.7) { approved.add(signal); logs.add("✅ Strategy approved (LLM offline): ${signal.question.take(40)}") }
                     }
                 }
 
-                for (signal in approvedSignals.take(3)) {
+                for (signal in approved.take(3)) {
                     try {
-                        val p = signal.ourEstimate
-                        val b = (1.0 / signal.currentPrice) - 1.0
-                        val kelly = ((b * p - (1.0 - p)) / b) * 0.25
-                        val positionSize = minOf(kelly * usdcBalance, usdcBalance * 0.20).coerceAtLeast(0.0)
-                        if (positionSize < 0.10) { logs.add("💸 Too small to trade"); continue }
-
-                        val tradeResult = walletManager.executeTrade(signal.marketId, signal.outcomeIndex, positionSize, signal.currentPrice * 1.02)
-                        if (tradeResult.success) {
-                            tradesExecuted++
-                            cycleEarnings += tradeResult.estimatedPnl
-                            logs.add("🎯 Trade: ${signal.marketQuestion.take(40)} | $${String.format("%.3f", positionSize)}")
-                            prefs.addTradeRecord(JSONObject().apply {
-                                put("time", System.currentTimeMillis()); put("market", signal.marketQuestion)
-                                put("strategy", signal.strategy); put("amount", positionSize); put("txHash", tradeResult.txHash)
-                            }.toString())
-                            prefs.addEarnings(tradeResult.estimatedPnl)
-                        } else { logs.add("❌ Trade failed: ${tradeResult.error}") }
-                    } catch (e: Exception) { logs.add("❌ Trade error: ${e.message?.take(50)}") }
+                        val size = signal.suggestedSizeUsdc.coerceAtMost(usdcBalance * 0.20)
+                        if (size < 0.10) { logs.add("💸 Position too small, skipping"); continue }
+                        val txHash = walletManager.transferUsdc(credentials, GarbageSysApp.POLYMARKET_CLOB_BASE, size)
+                        if (txHash != null) {
+                            logs.add("🎯 Trade: ${signal.question.take(40)} | $${String.format("%.3f", size)} | tx: ${txHash.take(10)}...")
+                            prefs.addTradeRecord(TradeRecord(
+                                marketId = signal.marketId,
+                                question = signal.question,
+                                strategy = signal.strategy.name,
+                                side = signal.side.name,
+                                amountUsdc = size,
+                                txHash = txHash,
+                                timestamp = System.currentTimeMillis()
+                            ))
+                        } else {
+                            logs.add("❌ Trade failed for ${signal.question.take(40)}")
+                        }
+                    } catch (e: Exception) {
+                        logs.add("❌ Trade error: ${e.message?.take(50)}")
+                    }
                     delay(2000)
                 }
             }
 
-            checkAndSendDailyEarnings(logs)
-            logs.add("✅ Cycle complete. Trades: $tradesExecuted")
-            prefs.setLastCycle(System.currentTimeMillis())
+            // Daily 50% send
+            checkAndSendDailyEarnings(credentials, walletState, logs)
+
+            logs.add("✅ Cycle complete.")
+
         } catch (e: Exception) {
             logs.add("💥 Cycle error: ${e.message}")
             Log.e(TAG, "Cycle error", e)
         }
-        for (log in logs) prefs.addAgentLog(log)
-        CycleResult(true, cycleEarnings, tradesExecuted, logs)
+        saveLogs(logs)
     }
 
-    private suspend fun checkAndSendDailyEarnings(logs: MutableList<String>) {
-        if (System.currentTimeMillis() - prefs.getLastDailySend() < 86400000L) return
-        val receivingWallet = prefs.getReceivingWallet()
-        if (receivingWallet.isEmpty()) { logs.add("⚠️ No receiving wallet set"); return }
-        val balance = try { walletManager.getUsdcBalance(prefs.getWalletAddress()) } catch (e: Exception) { return }
+    private fun polymarketClient() = PolymarketClient()
+
+    private suspend fun checkAndSendDailyEarnings(
+        credentials: org.web3j.crypto.Credentials,
+        walletState: WalletState,
+        logs: MutableList<String>
+    ) {
+        val setupState = prefs.setupStateFlow.firstOrNull() ?: return
+        val lastSend = setupState.lastDailySendAt
+        if (System.currentTimeMillis() - lastSend < 86400000L) return
+        val userWallet = walletState.userWalletAddress
+        if (userWallet.isEmpty()) { logs.add("⚠️ No receiving wallet set"); return }
+        val balance = walletState.usdcBalance
         val sendAmount = balance * 0.50
-        if (sendAmount < 0.50) { logs.add("📊 Daily P&L: $${String.format("%.2f",balance)} — too small to send (min $0.50)"); return }
-        try {
-            val result = walletManager.sendUsdc(receivingWallet, sendAmount)
-            if (result.success) {
-                prefs.addSent(sendAmount); prefs.setLastDailySend(System.currentTimeMillis())
-                logs.add("💸 Sent 50% ($${String.format("%.4f",sendAmount)}) to your wallet!")
-            } else { logs.add("⚠️ Daily send failed: ${result.error}") }
-        } catch (e: Exception) { logs.add("⚠️ Daily send error: ${e.message?.take(40)}") }
+        if (sendAmount < 0.50) { logs.add("📊 Daily P&L: $${String.format("%.2f", balance)} — too small (min $0.50)"); return }
+        val txHash = walletManager.transferUsdc(credentials, userWallet, sendAmount)
+        if (txHash != null) {
+            logs.add("💸 Sent 50% ($${String.format("%.4f", sendAmount)}) to your wallet! tx: ${txHash.take(10)}...")
+            prefs.saveSetupState(setupState.copy(lastDailySendAt = System.currentTimeMillis()))
+        } else {
+            logs.add("⚠️ Daily send failed")
+        }
+    }
+
+    private suspend fun saveLogs(logs: List<String>) {
+        for (log in logs) prefs.addCycleLog(AgentCycleLog(message = log, timestamp = System.currentTimeMillis()))
     }
 }
-
-data class CycleResult(val success: Boolean, val earnings: Double, val tradesExecuted: Int, val logs: List<String>)
