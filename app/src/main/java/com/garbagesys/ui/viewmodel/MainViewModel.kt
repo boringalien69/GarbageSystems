@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.garbagesys.data.db.PreferencesRepository
 import com.garbagesys.data.models.*
 import com.garbagesys.engine.agent.AgentOrchestrator
+import com.garbagesys.engine.faucet.FaucetManager
 import com.garbagesys.engine.llm.LlmEngine
 import com.garbagesys.engine.llm.ModelDownloadManager
 import com.garbagesys.engine.wallet.WalletManager
@@ -19,8 +20,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val llmEngine = LlmEngine(application)
     val downloadManager = ModelDownloadManager(application)
     val orchestrator = AgentOrchestrator(application)
+    private val faucetManager = FaucetManager(application)
 
-    // ── State flows from DataStore ──
     val setupState: StateFlow<AppSetupState> = prefs.setupStateFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSetupState())
 
@@ -45,18 +46,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val whaleWallets: StateFlow<List<WhaleWallet>> = prefs.whaleWalletsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // ── Download progress ──
+    // ── Airdrop opportunities ──
+    private val _airdropOpportunities = MutableStateFlow<List<AirdropOpportunity>>(emptyList())
+    val airdropOpportunities: StateFlow<List<AirdropOpportunity>> = _airdropOpportunities
+
+    init {
+        _airdropOpportunities.value = faucetManager.loadAirdrops()
+    }
+
     private val _downloadProgress = MutableStateFlow(0.0)
     val downloadProgress: StateFlow<Double> = _downloadProgress
 
     private val _downloadMessage = MutableStateFlow("")
     val downloadMessage: StateFlow<String> = _downloadMessage
 
-    // ── Available RAM ──
     val availableRamGb: Int get() = llmEngine.getAvailableRamGb()
     val recommendedModel: LlmModelInfo get() = llmEngine.recommendModel()
 
-    // ── Setup actions ──
     fun completeSetup(modelId: String, userWalletAddress: String) {
         viewModelScope.launch {
             val current = prefs.setupStateFlow.firstOrNull() ?: AppSetupState()
@@ -66,7 +72,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 userWalletSet = userWalletAddress.isNotEmpty(),
                 setupCompletedAt = System.currentTimeMillis()
             ))
-            // Save user wallet address
             val walletState = prefs.walletStateFlow.firstOrNull() ?: WalletState()
             prefs.saveWalletState(walletState.copy(userWalletAddress = userWalletAddress))
         }
@@ -100,13 +105,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun runCycleNow() {
-        viewModelScope.launch { orchestrator.runCycle() }
+        viewModelScope.launch {
+            orchestrator.runCycle()
+            _airdropOpportunities.value = faucetManager.loadAirdrops()
+        }
     }
 
     fun refreshWallet() {
         viewModelScope.launch {
             val creds = walletManager.getOrCreateWallet()
             walletManager.refreshWalletState(creds)
+        }
+    }
+
+    fun scanAirdrops() {
+        viewModelScope.launch {
+            val wallet = prefs.walletStateFlow.firstOrNull() ?: WalletState()
+            if (wallet.address.isEmpty()) return@launch
+            faucetManager.claimAll(wallet.address)
+            _airdropOpportunities.value = faucetManager.loadAirdrops()
         }
     }
 
