@@ -77,7 +77,7 @@ class LlmEngine(private val context: Context) {
             val options = LlmInferenceOptions.builder()
                 .setModelPath(modelFile.absolutePath)
                 .setMaxTokens(512)
-                .setMaxTopK(40)
+                .setTopK(40)
                 .setTemperature(0.1f)        // Low temp for consistent trading decisions
                 .setRandomSeed(42)
                 .build()
