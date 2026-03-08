@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.garbagesys.data.db.PreferencesRepository
 import com.garbagesys.data.models.*
 import com.garbagesys.engine.agent.AgentOrchestrator
+import com.garbagesys.engine.bootstrap.TelegramFarmer
 import com.garbagesys.engine.faucet.FaucetManager
 import com.garbagesys.engine.llm.LlmEngine
 import com.garbagesys.engine.llm.ModelDownloadManager
@@ -21,6 +22,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val downloadManager = ModelDownloadManager(application)
     val orchestrator = AgentOrchestrator(application)
     private val faucetManager = FaucetManager(application)
+    private val telegramFarmer = TelegramFarmer(application)
 
     val setupState: StateFlow<AppSetupState> = prefs.setupStateFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSetupState())
@@ -46,7 +48,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val whaleWallets: StateFlow<List<WhaleWallet>> = prefs.whaleWalletsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // ── Airdrop opportunities ──
+    // Airdrop opportunities
     private val _airdropOpportunities = MutableStateFlow<List<AirdropOpportunity>>(emptyList())
     val airdropOpportunities: StateFlow<List<AirdropOpportunity>> = _airdropOpportunities
 
@@ -63,6 +65,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val availableRamGb: Int get() = llmEngine.getAvailableRamGb()
     val recommendedModel: LlmModelInfo get() = llmEngine.recommendModel()
 
+    // Telegram farming
+    fun saveTelegramBotToken(token: String) = telegramFarmer.saveBotToken(token.trim())
+    fun getTelegramBotToken(): String = telegramFarmer.getBotToken() ?: ""
+    fun hasTelegramBotToken(): Boolean = telegramFarmer.hasBotToken()
+
+    // Setup
     fun completeSetup(modelId: String, userWalletAddress: String) {
         viewModelScope.launch {
             val current = prefs.setupStateFlow.firstOrNull() ?: AppSetupState()

@@ -1,9 +1,9 @@
 package com.garbagesys.engine.agent
 
 import android.content.Context
-import com.garbagesys.GarbageSysApp
 import com.garbagesys.data.db.PreferencesRepository
 import com.garbagesys.data.models.*
+import com.garbagesys.engine.bootstrap.TelegramFarmer
 import com.garbagesys.engine.faucet.FaucetManager
 import com.garbagesys.engine.llm.LlmEngine
 import com.garbagesys.engine.strategies.*
@@ -13,22 +13,6 @@ import kotlinx.coroutines.flow.firstOrNull
 import java.text.SimpleDateFormat
 import java.util.*
 
-/**
- * AgentOrchestrator is the autonomous brain of GarbageSys.
- *
- * Each cycle (every 15 minutes via WorkManager):
- * 1. Refresh wallet balance
- * 2. Run faucet bootstrap (if balance < threshold)
- * 3. Run all strategy engines to find signals
- * 4. Ask LLM to validate top signals
- * 5. Execute approved trades
- * 6. Check open positions for exit
- * 7. Calculate daily P&L, send 50% to user wallet
- * 8. Log everything to dashboard
- *
- * Future-proof: if any external API fails, it retries/skips gracefully.
- * The LLM can adapt to new market structures without code changes.
- */
 class AgentOrchestrator(private val context: Context) {
 
     private val prefs = PreferencesRepository(context)
@@ -36,11 +20,10 @@ class AgentOrchestrator(private val context: Context) {
     private val llmEngine = LlmEngine(context)
     private val polyClient = PolymarketClient()
     private val faucetManager = FaucetManager(context)
+    private val telegramFarmer = TelegramFarmer(context)
 
-    // ── Main Cycle ──
     suspend fun runCycle() = coroutineScope {
         log("🔄 Starting agent cycle...")
-
         try {
             val setupState = prefs.setupStateFlow.firstOrNull() ?: return@coroutineScope
             if (!setupState.isInitialized || !setupState.modelDownloaded) {
@@ -60,40 +43,54 @@ class AgentOrchestrator(private val context: Context) {
 
             // ── Phase 1: Bootstrap if needed ──
             if (usdcBalance < 1.0) {
-                log("🪣 Balance low. Running faucet bootstrap...", StrategyType.FAUCET_BOOTSTRAP)
-                val results = faucetManager.claimAll(credentials.address)
-                results.forEach { result ->
-                    log(if (result.success) "✅ Faucet: ${result.source} → ${result.amount}"
-                    else "⚠️ Faucet: ${result.source} — ${result.message}",
-                    StrategyType.FAUCET_BOOTSTRAP)
+                log("🪣 Balance low. Running bootstrap...", StrategyType.FAUCET_BOOTSTRAP)
+
+                // Tier A: Telegram farming (if token configured)
+                if (telegramFarmer.hasBotToken()) {
+                    log("📱 Running Telegram farming cycle...", StrategyType.FAUCET_BOOTSTRAP)
+                    val farmResults = telegramFarmer.runFarmingCycle()
+                    farmResults.forEach { result ->
+                        log(
+                            if (result.success) "✅ TG Farm: ${result.target} → ${result.reward}"
+                            else "⚠️ TG Farm: ${result.message}",
+                            StrategyType.FAUCET_BOOTSTRAP
+                        )
+                    }
+                    val successCount = farmResults.count { it.success }
+                    if (successCount > 0) {
+                        log("🎉 Telegram farming: $successCount/${farmResults.size} bots claimed!", StrategyType.FAUCET_BOOTSTRAP)
+                    }
+                } else {
+                    log("📱 Telegram farming: no bot token. Add in Settings → Bootstrap.", StrategyType.FAUCET_BOOTSTRAP)
                 }
-                // Refresh balance after claiming
+
+                // Tier B: Faucets + airdrop scanner
+                val faucetResults = faucetManager.claimAll(credentials.address)
+                faucetResults.forEach { result ->
+                    log(
+                        if (result.success) "✅ Faucet: ${result.source} → ${result.amount}"
+                        else "⚠️ Faucet: ${result.source} — ${result.message}",
+                        StrategyType.FAUCET_BOOTSTRAP
+                    )
+                }
+
                 walletManager.refreshWalletState(credentials)
             }
 
-            // ── Phase 2: Load LLM if not already loaded ──
+            // ── Phase 2: Load LLM ──
             val modelId = setupState.selectedModelId
             if (modelId.isNotEmpty()) {
                 llmEngine.loadModel(modelId)
             }
 
-            // ── Phase 3: Find signals from all strategies ──
+            // ── Phase 3: Find signals ──
             log("🔍 Scanning markets for signals...")
             val allSignals = mutableListOf<MarketSignal>()
 
-            // Run strategies in parallel for speed
-            val weatherJob = async {
-                WeatherStrategy(polyClient, configs.weather).findSignals(usdcBalance)
-            }
-            val whaleJob = async {
-                WhaleCopyStrategy(polyClient, configs.whaleCopy).findSignals(usdcBalance)
-            }
-            val contraJob = async {
-                CrowdContraStrategy(polyClient, configs.crowdContra).findSignals(usdcBalance)
-            }
-            val latencyJob = async {
-                LatencyArbStrategy(polyClient, configs.latencyArb).findSignals(usdcBalance)
-            }
+            val weatherJob = async { WeatherStrategy(polyClient, configs.weather).findSignals(usdcBalance) }
+            val whaleJob = async { WhaleCopyStrategy(polyClient, configs.whaleCopy).findSignals(usdcBalance) }
+            val contraJob = async { CrowdContraStrategy(polyClient, configs.crowdContra).findSignals(usdcBalance) }
+            val latencyJob = async { LatencyArbStrategy(polyClient, configs.latencyArb).findSignals(usdcBalance) }
 
             allSignals += weatherJob.await()
             allSignals += whaleJob.await()
@@ -102,7 +99,7 @@ class AgentOrchestrator(private val context: Context) {
 
             log("📊 Found ${allSignals.size} potential signals")
 
-            // ── Phase 4: LLM validation of top signals ──
+            // ── Phase 4: LLM validation ──
             val topSignals = allSignals.sortedByDescending { it.edge }.take(5)
             val approvedSignals = mutableListOf<MarketSignal>()
 
@@ -124,23 +121,21 @@ class AgentOrchestrator(private val context: Context) {
 
                 if (decision.verdict == "YES" && decision.confidence >= 0.5) {
                     approvedSignals.add(signal)
-                    log("✅ LLM approved: ${signal.question.take(50)}... (${decision.reasoning.take(80)})",
-                        signal.strategy)
+                    log("✅ LLM approved: ${signal.question.take(50)}... (${decision.reasoning.take(80)})", signal.strategy)
                 } else {
-                    log("❌ LLM skipped: ${signal.question.take(50)}... (${decision.reasoning.take(80)})",
-                        signal.strategy)
+                    log("❌ LLM skipped: ${signal.question.take(50)}... (${decision.reasoning.take(80)})", signal.strategy)
                 }
             }
 
-            // ── Phase 5: Execute approved trades ──
+            // ── Phase 5: Execute trades ──
             if (approvedSignals.isNotEmpty() && usdcBalance >= 1.0) {
                 log("⚡ Executing ${approvedSignals.size} trades...")
-                for (signal in approvedSignals.take(3)) { // max 3 trades per cycle
+                for (signal in approvedSignals.take(3)) {
                     executeTrade(signal, credentials.address)
                 }
             }
 
-            // ── Phase 6: Check daily P&L and send 50% to user ──
+            // ── Phase 6: Daily send ──
             checkAndSendDailyEarnings(credentials, walletState)
 
             log("✅ Cycle complete.")
@@ -152,9 +147,6 @@ class AgentOrchestrator(private val context: Context) {
     }
 
     private suspend fun executeTrade(signal: MarketSignal, walletAddress: String) {
-        // For now, log the trade as OPEN (actual Polymarket order execution
-        // requires EIP-712 signing which is included but needs Polymarket API key for placing orders)
-        // The full execution pipeline uses the Polymarket CLOB API
         val tradeId = UUID.randomUUID().toString()
         val trade = TradeRecord(
             id = tradeId,
@@ -170,14 +162,9 @@ class AgentOrchestrator(private val context: Context) {
             timestamp = System.currentTimeMillis()
         )
         prefs.appendTrade(trade)
-        log("📝 Trade logged: ${signal.side} ${signal.question.take(40)}... | \$${String.format("%.2f", signal.suggestedSizeUsdc)}",
-            signal.strategy)
+        log("📝 Trade logged: ${signal.side} ${signal.question.take(40)}... | \$${String.format("%.2f", signal.suggestedSizeUsdc)}", signal.strategy)
     }
 
-    /**
-     * Check if 24h have passed since last daily send.
-     * If so, calculate today's P&L and send 50% to user wallet.
-     */
     private suspend fun checkAndSendDailyEarnings(
         credentials: org.web3j.crypto.Credentials,
         walletState: WalletState
@@ -185,11 +172,9 @@ class AgentOrchestrator(private val context: Context) {
         val lastSend = prefs.lastDailySendFlow.firstOrNull() ?: 0L
         val now = System.currentTimeMillis()
         val twentyFourHours = 24 * 60 * 60 * 1000L
-
         if (now - lastSend < twentyFourHours) return
         if (walletState.userWalletAddress.isEmpty()) return
 
-        // Calculate daily P&L from trades
         val trades = prefs.tradeHistoryFlow.firstOrNull() ?: emptyList()
         val todayStart = now - twentyFourHours
         val todayTrades = trades.filter { it.timestamp >= todayStart && it.status != TradeStatus.OPEN }
@@ -203,24 +188,16 @@ class AgentOrchestrator(private val context: Context) {
         val toSend = dailyPnl * 0.50
         log("💸 Daily earnings: \$${String.format("%.2f", dailyPnl)}. Sending 50% (\$${String.format("%.2f", toSend)}) to your wallet...")
 
-        val txHash = walletManager.transferUsdc(
-            credentials, walletState.userWalletAddress, toSend
-        )
+        val txHash = walletManager.transferUsdc(credentials, walletState.userWalletAddress, toSend)
 
         if (txHash != null) {
             log("✅ Sent \$${String.format("%.2f", toSend)} USDC → ${walletState.userWalletAddress.take(10)}... TX: $txHash")
             prefs.setLastDailySend(now)
-
-            // Update totals
             val current = prefs.walletStateFlow.firstOrNull() ?: WalletState()
-            prefs.saveWalletState(
-                current.copy(
-                    totalEarned = current.totalEarned + dailyPnl,
-                    totalSentToUser = current.totalSentToUser + toSend
-                )
-            )
-
-            // Log daily summary
+            prefs.saveWalletState(current.copy(
+                totalEarned = current.totalEarned + dailyPnl,
+                totalSentToUser = current.totalSentToUser + toSend
+            ))
             val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(now))
             prefs.upsertDailyEarnings(DailyEarnings(
                 date = dateStr,
@@ -236,7 +213,6 @@ class AgentOrchestrator(private val context: Context) {
         }
     }
 
-    // ── Logging ──
     private suspend fun log(
         message: String,
         strategy: StrategyType? = null,

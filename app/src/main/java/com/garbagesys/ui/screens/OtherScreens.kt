@@ -12,6 +12,8 @@ import androidx.compose.ui.*
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.*
 import androidx.compose.ui.unit.*
 import com.garbagesys.data.models.*
@@ -247,9 +249,14 @@ fun SettingsScreen(vm: MainViewModel) {
     val setupState by vm.setupState.collectAsState()
     val configs by vm.strategyConfigs.collectAsState()
     var userWalletInput by remember { mutableStateOf(walletState.userWalletAddress) }
+    var botTokenInput by remember { mutableStateOf(vm.getTelegramBotToken()) }
+    var botTokenVisible by remember { mutableStateOf(false) }
+    var botTokenSaved by remember { mutableStateOf(vm.hasTelegramBotToken()) }
 
     LazyColumn(modifier = Modifier.fillMaxSize().background(BgDeep), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Settings", style = MaterialTheme.typography.displayMedium.copy(fontFamily = ParafinaFamily, fontWeight = FontWeight.Black), color = GreenPrimary) }
+
+        // Wallet
         item {
             GsCard {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -267,6 +274,58 @@ fun SettingsScreen(vm: MainViewModel) {
                 }
             }
         }
+
+        // Telegram Bootstrap
+        item {
+            GsCard {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("📱", style = MaterialTheme.typography.bodyLarge)
+                        GsLabel("TELEGRAM FARMING BOOTSTRAP")
+                    }
+                    GsBodyText("Auto-farms 8 Telegram mini-app games every cycle. Earns real tokens to bootstrap trading wallet from zero.")
+                    Surface(
+                        color = if (botTokenSaved) ProfitGreen.copy(alpha = 0.1f) else WarnAmber.copy(alpha = 0.1f),
+                        shape = MaterialTheme.shapes.small
+                    ) {
+                        Text(
+                            if (botTokenSaved) "✅ Bot token configured — farming active" else "⚠️ No bot token — add below to activate",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (botTokenSaved) ProfitGreen else WarnAmber,
+                            modifier = Modifier.padding(8.dp)
+                        )
+                    }
+                    GsDivider()
+                    Text("1. Open Telegram → search @BotFather\n2. Send /newbot → follow steps\n3. Copy the token (looks like 7123456:AAH...)\n4. Paste below and save",
+                        style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    GsDivider()
+                    OutlinedTextField(
+                        value = botTokenInput,
+                        onValueChange = { botTokenInput = it },
+                        label = { Text("Bot Token (from @BotFather)", color = TextMuted) },
+                        modifier = Modifier.fillMaxWidth(),
+                        visualTransformation = if (botTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { botTokenVisible = !botTokenVisible }) {
+                                Icon(if (botTokenVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, null, tint = TextMuted)
+                            }
+                        },
+                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = GreenPrimary, unfocusedBorderColor = BorderColor, focusedTextColor = TextPrimary, unfocusedTextColor = TextPrimary, cursorColor = GreenPrimary),
+                        maxLines = 2
+                    )
+                    GsButton("Save Bot Token", onClick = {
+                        vm.saveTelegramBotToken(botTokenInput)
+                        botTokenSaved = botTokenInput.isNotEmpty()
+                    })
+                    if (botTokenSaved) {
+                        Text("Farming: TapSwap • Tomarket • HereWallet • Pixelverse • Boinker • Major • MemeFi • Catizen",
+                            style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
+                }
+            }
+        }
+
+        // Strategy toggles
         item {
             GsCard {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -289,6 +348,8 @@ fun SettingsScreen(vm: MainViewModel) {
                 }
             }
         }
+
+        // Model info
         item {
             GsCard {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -299,13 +360,15 @@ fun SettingsScreen(vm: MainViewModel) {
                 }
             }
         }
+
+        // About
         item {
             GsCard {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     GsLabel("ABOUT")
-                    Text("GarbageSys v1.1.0", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    Text("GarbageSys v1.2.0", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
                     Text("Fully offline AI trading agent", style = MaterialTheme.typography.bodySmall, color = TextMuted)
-                    Text("No cloud dependency after setup", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                    Text("Bootstrap: Telegram farming + faucets + airdrop scanner", style = MaterialTheme.typography.bodySmall, color = TextMuted)
                     Text("Strategies: Weather/NOAA, Whale copy, Crowd contra, Latency arb", style = MaterialTheme.typography.bodySmall, color = TextMuted)
                 }
             }
