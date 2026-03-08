@@ -12,10 +12,9 @@ android {
         applicationId = "com.garbagesys"
         minSdk = 28  // Android 9+
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        // NDK ABI filters — arm64 only (all modern Android phones)
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -58,6 +57,10 @@ android {
             excludes += "META-INF/NOTICE.md"
             excludes += "META-INF/LICENSE.md"
         }
+        // Required for MediaPipe native libs
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
@@ -89,27 +92,24 @@ dependencies {
     // ── Serialization ──
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
 
-    // ── Networking (HTTP client — no OkHttp3 conflict with web3j) ──
+    // ── Networking ──
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // ── Web3j Android (Polygon/EVM wallet) ──
     implementation("org.web3j:core:4.9.4")
 
-    // ── llama.cpp Android binding (local LLM inference) ──
-    // Using the SmolChat / llmedge approach via JNI prebuilt .so
-    // llmedge placeholder
+    // ── MediaPipe LLM Inference — REAL on-device GGUF inference ──
+    // Runs Gemma/Mistral/Llama GGUF models natively on Android GPU/CPU
+    implementation("com.google.mediapipe:tasks-genai:0.10.14")
 
     // ── Security / Keystore ──
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // ── WebView (in-app browser for faucets) ──
+    // ── WebView ──
     implementation("androidx.webkit:webkit:1.11.0")
 
-    // ── Work manager for background strategies ──
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
-
-    // ── Charts for dashboard ──
+    // ── Charts ──
     implementation("com.patrykandpatrick.vico:compose-m3:1.15.0")
     implementation("com.patrykandpatrick.vico:core:1.15.0")
 
