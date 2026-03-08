@@ -41,35 +41,29 @@ class AgentOrchestrator(private val context: Context) {
 
             log("💰 Wallet: \$${String.format("%.2f", usdcBalance)} USDC | ${String.format("%.4f", maticBalance)} MATIC")
 
-            // ── Phase 1: Bootstrap if needed ──
+            // ── Phase 1: Bootstrap if needed ──────────────────────────────────
             if (usdcBalance < 1.0) {
-                log("🪣 Balance low. Running bootstrap...", StrategyType.FAUCET_BOOTSTRAP)
+                log("🪣 Balance low — running full bootstrap...", StrategyType.FAUCET_BOOTSTRAP)
 
-                // Tier A: Telegram farming (if token configured)
-                if (telegramFarmer.hasBotToken()) {
-                    log("📱 Running Telegram farming cycle...", StrategyType.FAUCET_BOOTSTRAP)
-                    val farmResults = telegramFarmer.runFarmingCycle()
-                    farmResults.forEach { result ->
-                        log(
-                            if (result.success) "✅ TG Farm: ${result.target} → ${result.reward}"
-                            else "⚠️ TG Farm: ${result.message}",
-                            StrategyType.FAUCET_BOOTSTRAP
-                        )
-                    }
+                // Tier A: Telegram MTProto farming (real user account)
+                if (telegramFarmer.hasSessionString()) {
+                    log("📱 Starting Telegram MTProto farming cycle...", StrategyType.FAUCET_BOOTSTRAP)
+                    val farmResults = telegramFarmer.runFarmingCycle(credentials.address)
                     val successCount = farmResults.count { it.success }
-                    if (successCount > 0) {
-                        log("🎉 Telegram farming: $successCount/${farmResults.size} bots claimed!", StrategyType.FAUCET_BOOTSTRAP)
+                    farmResults.forEach { result ->
+                        log(result.message, StrategyType.FAUCET_BOOTSTRAP, result.message.contains("Error") || result.message.contains("failed", true))
                     }
+                    log("📊 Telegram farming: $successCount/${farmResults.size} bots claimed", StrategyType.FAUCET_BOOTSTRAP)
                 } else {
-                    log("📱 Telegram farming: no bot token. Add in Settings → Bootstrap.", StrategyType.FAUCET_BOOTSTRAP)
+                    log("📱 Telegram farming inactive — add session string in Settings", StrategyType.FAUCET_BOOTSTRAP)
                 }
 
-                // Tier B: Faucets + airdrop scanner
+                // Tier B: HTTP faucets + airdrop scanner
                 val faucetResults = faucetManager.claimAll(credentials.address)
                 faucetResults.forEach { result ->
                     log(
-                        if (result.success) "✅ Faucet: ${result.source} → ${result.amount}"
-                        else "⚠️ Faucet: ${result.source} — ${result.message}",
+                        if (result.success) "✅ ${result.source} → ${result.amount}"
+                        else "⚠️ ${result.source}: ${result.message}",
                         StrategyType.FAUCET_BOOTSTRAP
                     )
                 }
@@ -77,13 +71,14 @@ class AgentOrchestrator(private val context: Context) {
                 walletManager.refreshWalletState(credentials)
             }
 
-            // ── Phase 2: Load LLM ──
-            val modelId = setupState.selectedModelId
-            if (modelId.isNotEmpty()) {
-                llmEngine.loadModel(modelId)
+            // ── Phase 2: Load LLM ──────────────────────────────────────────────
+            if (setupState.selectedModelId.isNotEmpty()) {
+                val loaded = llmEngine.loadModel(setupState.selectedModelId)
+                if (loaded) log("🧠 LLM loaded: ${setupState.selectedModelId}")
+                else log("⚠️ LLM not loaded — using rule-based decisions", StrategyType.FAUCET_BOOTSTRAP)
             }
 
-            // ── Phase 3: Find signals ──
+            // ── Phase 3: Find signals ──────────────────────────────────────────
             log("🔍 Scanning markets for signals...")
             val allSignals = mutableListOf<MarketSignal>()
 
@@ -99,7 +94,7 @@ class AgentOrchestrator(private val context: Context) {
 
             log("📊 Found ${allSignals.size} potential signals")
 
-            // ── Phase 4: LLM validation ──
+            // ── Phase 4: LLM validation ────────────────────────────────────────
             val topSignals = allSignals.sortedByDescending { it.edge }.take(5)
             val approvedSignals = mutableListOf<MarketSignal>()
 
@@ -116,26 +111,28 @@ class AgentOrchestrator(private val context: Context) {
                         Reasoning: ${signal.reasoning}
                         Current wallet: \$${String.format("%.2f", usdcBalance)} USDC
                     """.trimIndent(),
-                    question = "Should we place this trade? Consider risk, edge quality, and available capital."
+                    question = "Should we place this trade?"
                 )
 
                 if (decision.verdict == "YES" && decision.confidence >= 0.5) {
                     approvedSignals.add(signal)
-                    log("✅ LLM approved: ${signal.question.take(50)}... (${decision.reasoning.take(80)})", signal.strategy)
+                    log("✅ Approved: ${signal.question.take(50)}... [${decision.reasoning.take(60)}]", signal.strategy)
                 } else {
-                    log("❌ LLM skipped: ${signal.question.take(50)}... (${decision.reasoning.take(80)})", signal.strategy)
+                    log("❌ Skipped: ${signal.question.take(50)}... [${decision.reasoning.take(60)}]", signal.strategy)
                 }
             }
 
-            // ── Phase 5: Execute trades ──
+            // ── Phase 5: Execute trades ────────────────────────────────────────
             if (approvedSignals.isNotEmpty() && usdcBalance >= 1.0) {
-                log("⚡ Executing ${approvedSignals.size} trades...")
+                log("⚡ Executing ${approvedSignals.size} approved trades...")
                 for (signal in approvedSignals.take(3)) {
                     executeTrade(signal, credentials.address)
                 }
+            } else if (usdcBalance < 1.0) {
+                log("💸 Insufficient balance for trading — bootstrap still running")
             }
 
-            // ── Phase 6: Daily send ──
+            // ── Phase 6: Daily earnings send ───────────────────────────────────
             checkAndSendDailyEarnings(credentials, walletState)
 
             log("✅ Cycle complete.")
@@ -147,9 +144,8 @@ class AgentOrchestrator(private val context: Context) {
     }
 
     private suspend fun executeTrade(signal: MarketSignal, walletAddress: String) {
-        val tradeId = UUID.randomUUID().toString()
         val trade = TradeRecord(
-            id = tradeId,
+            id = UUID.randomUUID().toString(),
             strategy = signal.strategy,
             marketId = signal.marketId,
             marketQuestion = signal.question,
@@ -162,7 +158,7 @@ class AgentOrchestrator(private val context: Context) {
             timestamp = System.currentTimeMillis()
         )
         prefs.appendTrade(trade)
-        log("📝 Trade logged: ${signal.side} ${signal.question.take(40)}... | \$${String.format("%.2f", signal.suggestedSizeUsdc)}", signal.strategy)
+        log("📝 Trade opened: ${signal.side} ${signal.question.take(40)}... | \$${String.format("%.2f", signal.suggestedSizeUsdc)}", signal.strategy)
     }
 
     private suspend fun checkAndSendDailyEarnings(
@@ -181,15 +177,14 @@ class AgentOrchestrator(private val context: Context) {
         val dailyPnl = todayTrades.sumOf { it.pnl ?: 0.0 }
 
         if (dailyPnl <= 0.5) {
-            log("📊 Daily P&L: \$${String.format("%.2f", dailyPnl)} — too small to send (min \$0.50)")
+            log("📊 Daily P&L: \$${String.format("%.2f", dailyPnl)} — below \$0.50 minimum send threshold")
             return
         }
 
         val toSend = dailyPnl * 0.50
-        log("💸 Daily earnings: \$${String.format("%.2f", dailyPnl)}. Sending 50% (\$${String.format("%.2f", toSend)}) to your wallet...")
+        log("💸 Sending 50% of \$${String.format("%.2f", dailyPnl)} → \$${String.format("%.2f", toSend)} to your wallet...")
 
         val txHash = walletManager.transferUsdc(credentials, walletState.userWalletAddress, toSend)
-
         if (txHash != null) {
             log("✅ Sent \$${String.format("%.2f", toSend)} USDC → ${walletState.userWalletAddress.take(10)}... TX: $txHash")
             prefs.setLastDailySend(now)
@@ -209,15 +204,11 @@ class AgentOrchestrator(private val context: Context) {
                     todayTrades.count { it.status == TradeStatus.CLOSED_WIN }.toDouble() / todayTrades.size
             ))
         } else {
-            log("⚠️ Failed to send daily earnings. Will retry next cycle.", isError = true)
+            log("⚠️ Failed to send daily earnings — will retry next cycle", isError = true)
         }
     }
 
-    private suspend fun log(
-        message: String,
-        strategy: StrategyType? = null,
-        isError: Boolean = false
-    ) {
+    private suspend fun log(message: String, strategy: StrategyType? = null, isError: Boolean = false) {
         prefs.appendLog(AgentCycleLog(
             id = UUID.randomUUID().toString(),
             timestamp = System.currentTimeMillis(),

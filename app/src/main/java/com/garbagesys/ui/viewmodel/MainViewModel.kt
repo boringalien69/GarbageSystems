@@ -69,6 +69,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun saveTelegramBotToken(token: String) = telegramFarmer.saveBotToken(token.trim())
     fun getTelegramBotToken(): String = telegramFarmer.getBotToken() ?: ""
     fun hasTelegramBotToken(): Boolean = telegramFarmer.hasBotToken()
+    fun saveBotInitData(botKey: String, initData: String) = telegramFarmer.saveInitData(botKey, initData)
+    fun hasBotInitData(botKey: String): Boolean = !telegramFarmer.getInitData(botKey).isNullOrEmpty()
+    fun saveTelegramSession(session: String) = telegramFarmer.saveSessionString(session.trim())
 
     // Setup
     fun completeSetup(modelId: String, userWalletAddress: String) {

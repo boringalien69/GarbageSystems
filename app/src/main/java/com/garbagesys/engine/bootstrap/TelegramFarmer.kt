@@ -2,88 +2,74 @@ package com.garbagesys.engine.bootstrap
 
 import android.content.Context
 import android.util.Log
-import kotlinx.coroutines.*
-import kotlinx.serialization.encodeToString
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
- * TelegramFarmer — autonomous Telegram mini-app farming via Bot API
+ * TelegramFarmer — Real Mini App farming via direct HTTP
  *
- * How it works:
- * 1. Our GarbageSys bot interacts with farming game bots via Telegram Bot API
- * 2. Sends /start and claim commands to known farming bots
- * 3. Parses responses to track earned rewards
- * 4. Logs all activity to the dashboard
+ * Each farming bot is a Telegram Mini App. Their backends accept
+ * HTTP requests authenticated with the user's initData string.
  *
- * Games targeted (all pay real TON/MATIC rewards):
- * - @tapswap_bot         — tap-to-earn, daily claims
- * - @Tomarket_ai_bot     — daily claims, real TON payouts
- * - @herewalletbot       — HOT token, bridges to NEAR/EVM
- * - @PixelverseBOT       — daily claims
- * - @boinker_bot         — daily claims, TON rewards
+ * Flow:
+ * 1. User opens each bot once in Telegram, copies the initData query string
+ *    from the bot's WebApp URL (shown in Settings guide)
+ * 2. App stores initData per bot in SharedPreferences
+ * 3. Each farming cycle posts to each bot's real API endpoints
+ * 4. No Python, no Termux, no MTProto — pure OkHttp
  *
- * No MTProto needed — pure Bot API HTTP calls.
- * Bot token stored encrypted in SharedPrefs.
+ * initData format (URL-encoded):
+ * query_id=AAH...&user=%7B%22id%22%3A7951767421...%7D&auth_date=1234567890&hash=abc123...
  */
 class TelegramFarmer(private val context: Context) {
 
     private val TAG = "TelegramFarmer"
-    private val BASE = "https://api.telegram.org/bot"
+    private val prefs = context.getSharedPreferences("gs_tg", Context.MODE_PRIVATE)
+    private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    private val json = Json { ignoreUnknownKeys = true }
+    private val JSON_TYPE = "application/json; charset=utf-8".toMediaType()
 
-    // ── Token storage ─────────────────────────────────────────────────────────
-    fun saveBotToken(token: String) {
-        context.getSharedPreferences("gs_tg", Context.MODE_PRIVATE)
-            .edit().putString("bot_token", token).apply()
-    }
-
-    fun getBotToken(): String? =
-        context.getSharedPreferences("gs_tg", Context.MODE_PRIVATE)
-            .getString("bot_token", null)
-
+    // ── Storage ────────────────────────────────────────────────────────────────
+    fun saveBotToken(token: String) = prefs.edit().putString("bot_token", token.trim()).apply()
+    fun getBotToken(): String? = prefs.getString("bot_token", null)
     fun hasBotToken(): Boolean = !getBotToken().isNullOrEmpty()
 
-    // ── Farming game targets ──────────────────────────────────────────────────
-    data class FarmTarget(
-        val botUsername: String,
+    fun saveInitData(botKey: String, initData: String) =
+        prefs.edit().putString("initdata_$botKey", initData.trim()).apply()
+
+    fun getInitData(botKey: String): String? =
+        prefs.getString("initdata_$botKey", null)
+
+    fun hasAnyInitData(): Boolean =
+        FARM_BOTS.any { !getInitData(it.key).isNullOrEmpty() }
+
+    // Also keep session string support for future use
+    fun saveSessionString(session: String) = prefs.edit().putString("session_string", session.trim()).apply()
+    fun hasSessionString(): Boolean = !prefs.getString("session_string", null).isNullOrEmpty()
+
+    // ── Bot definitions ────────────────────────────────────────────────────────
+    data class FarmBot(
+        val key: String,
         val displayName: String,
-        val startCommand: String = "/start",
-        val claimCommand: String = "/claim",
-        val cooldownHours: Int = 8,
-        val expectedReward: String = "tokens"
+        val telegramLink: String,
+        val cooldownHours: Int
     )
 
-    private val farmTargets = listOf(
-        FarmTarget("tapswap_bot",       "TapSwap",        "/start", "/claim",   8,  "TAPS→TON"),
-        FarmTarget("Tomarket_ai_bot",   "Tomarket",       "/start", "/checkin", 24, "TOMA→TON"),
-        FarmTarget("herewalletbot",     "HereWallet HOT", "/start", "/claim",   24, "HOT"),
-        FarmTarget("PixelverseBOT",     "Pixelverse",     "/start", "/claim",   8,  "PIXEL"),
-        FarmTarget("boinker_bot",       "Boinker",        "/start", "/tap",     1,  "BOIN→TON"),
-        FarmTarget("major",             "Major",          "/start", "/claim",   24, "MAJOR→TON"),
-        FarmTarget("memefi_bot",        "MemeFi",         "/start", "/collect", 8,  "MEMEFI"),
-        FarmTarget("Catizen_Official_Bot", "Catizen",     "/start", "/claim",   24, "CATI→TON")
-    )
-
-    // Cooldown tracking
-    private fun getLastFarm(botName: String): Long =
-        context.getSharedPreferences("gs_tg_cd", Context.MODE_PRIVATE)
-            .getLong(botName, 0L)
-
-    private fun setLastFarm(botName: String) =
-        context.getSharedPreferences("gs_tg_cd", Context.MODE_PRIVATE)
-            .edit().putLong(botName, System.currentTimeMillis()).apply()
-
-    // ── Main farming run ──────────────────────────────────────────────────────
     data class FarmResult(
         val target: String,
         val success: Boolean,
@@ -92,226 +78,291 @@ class TelegramFarmer(private val context: Context) {
         val timestamp: Long = System.currentTimeMillis()
     )
 
-    suspend fun runFarmingCycle(): List<FarmResult> = withContext(Dispatchers.IO) {
-        val token = getBotToken()
-        if (token.isNullOrEmpty()) {
-            return@withContext listOf(FarmResult("Telegram", false, "No bot token configured"))
-        }
+    companion object {
+        val FARM_BOTS = listOf(
+            FarmBot("tomarket",  "Tomarket 🍅",    "https://t.me/Tomarket_ai_bot/app?startapp=000041bn", 8),
+            FarmBot("paws",      "PAWS 🐾",         "https://t.me/PAWSOG_bot/PAWS?startapp=pHJCKGh4",    24),
+            FarmBot("boinker",   "Boinker 🪀",      "https://t.me/boinker_bot/boink?startapp=boink",      1),
+            FarmBot("major",     "Major ⭐",         "https://t.me/major/start?startapp=start",            24),
+            FarmBot("notpixel",  "NotPixel 🎨",     "https://t.me/notpixel/app?startapp=f7951767421",     24),
+        )
+    }
 
-        val results = mutableListOf<FarmResult>()
-        val now = System.currentTimeMillis()
+    // ── Main cycle ─────────────────────────────────────────────────────────────
+    suspend fun runFarmingCycle(walletAddress: String): List<FarmResult> =
+        withContext(Dispatchers.IO) {
+            val results = mutableListOf<FarmResult>()
 
-        // First verify bot is working
-        val botInfo = getBotInfo(token)
-        if (botInfo == null) {
-            results.add(FarmResult("Telegram", false, "Bot token invalid or API unreachable"))
-            return@withContext results
-        }
-        results.add(FarmResult("Telegram", true, "✅ Bot @${botInfo} connected"))
-
-        // Farm each target
-        for (target in farmTargets) {
-            val lastFarm = getLastFarm(target.botUsername)
-            val cooldownMs = target.cooldownHours * 60 * 60 * 1000L
-
-            if (now - lastFarm < cooldownMs) {
-                val remaining = ((cooldownMs - (now - lastFarm)) / 3600000)
-                results.add(FarmResult(target.displayName, false, "Cooldown: ${remaining}h remaining", target.expectedReward))
-                continue
+            if (!hasAnyInitData()) {
+                return@withContext listOf(
+                    FarmResult("Telegram Farming", false,
+                        "No initData saved. Go to Settings → Telegram Farming → add query strings for each bot.")
+                )
             }
 
-            try {
-                // Step 1: Get the chat ID for this bot by sending /start
-                val chatId = getOrCreateChatWithBot(token, target.botUsername)
-                if (chatId == null) {
-                    results.add(FarmResult(target.displayName, false, "Could not reach @${target.botUsername}"))
+            for (bot in FARM_BOTS) {
+                val initData = getInitData(bot.key)
+                if (initData.isNullOrEmpty()) {
+                    results.add(FarmResult(bot.displayName, false, "Not configured — add initData in Settings"))
                     continue
                 }
 
-                // Step 2: Send start command
-                sendMessage(token, chatId, target.startCommand)
-                delay(2000)
-
-                // Step 3: Send claim command
-                val response = sendMessageAndGetReply(token, chatId, target.claimCommand)
-                delay(1500)
-
-                // Step 4: Parse response for success indicators
-                val success = response != null && (
-                    response.contains("claim", true) ||
-                    response.contains("reward", true) ||
-                    response.contains("earned", true) ||
-                    response.contains("success", true) ||
-                    response.contains("collected", true) ||
-                    response.contains("✅") ||
-                    response.contains("🎉") ||
-                    response.contains("💰")
-                )
-
-                if (success) {
-                    setLastFarm(target.botUsername)
-                    results.add(FarmResult(
-                        target.displayName, true,
-                        "✅ Claimed from ${target.displayName}",
-                        target.expectedReward
-                    ))
-                } else {
-                    results.add(FarmResult(
-                        target.displayName, false,
-                        "⚠️ ${target.displayName}: ${response?.take(60) ?: "No response"}"
-                    ))
+                // Check cooldown
+                val lastClaim = prefs.getLong("farm_cd_${bot.key}", 0L)
+                val cooldownMs = bot.cooldownHours * 3600 * 1000L
+                val now = System.currentTimeMillis()
+                if (now - lastClaim < cooldownMs) {
+                    val remH = ((cooldownMs - (now - lastClaim)) / 3600000)
+                    results.add(FarmResult(bot.displayName, false, "Cooldown: ${remH}h remaining"))
+                    continue
                 }
 
-            } catch (e: Exception) {
-                results.add(FarmResult(target.displayName, false, "Error: ${e.message?.take(50)}"))
+                try {
+                    val result = when (bot.key) {
+                        "tomarket" -> farmTomarket(initData, bot.displayName)
+                        "paws"     -> farmPaws(initData, bot.displayName)
+                        "boinker"  -> farmBoinker(initData, bot.displayName)
+                        "major"    -> farmMajor(initData, bot.displayName)
+                        "notpixel" -> farmNotPixel(initData, bot.displayName)
+                        else -> FarmResult(bot.displayName, false, "Unknown bot")
+                    }
+                    if (result.success) {
+                        prefs.edit().putLong("farm_cd_${bot.key}", now).apply()
+                    }
+                    results.add(result)
+                } catch (e: Exception) {
+                    Log.e(TAG, "${bot.key} error: ${e.message}")
+                    results.add(FarmResult(bot.displayName, false, "Error: ${e.message?.take(60)}"))
+                }
+
+                delay(2000L)
             }
 
-            delay(3000) // Polite delay between bots
+            results
         }
 
-        results
-    }
+    // ── Tomarket ───────────────────────────────────────────────────────────────
+    private suspend fun farmTomarket(initData: String, name: String): FarmResult =
+        withContext(Dispatchers.IO) {
+            val base = "https://api-gw.tomarket.ai/tomarket-game-v1"
 
-    // ── Telegram Bot API helpers ──────────────────────────────────────────────
-
-    private suspend fun getBotInfo(token: String): String? {
-        return try {
-            val resp = client.newCall(
-                Request.Builder().url("$BASE$token/getMe").build()
+            // Step 1: login to get token
+            val loginBody = """{"init_data":"$initData"}""".toRequestBody(JSON_TYPE)
+            val loginResp = client.newCall(
+                Request.Builder().url("$base/user/login")
+                    .post(loginBody)
+                    .header("Content-Type", "application/json")
+                    .build()
             ).execute()
-            val body = resp.body?.string() ?: return null
-            val parsed = json.parseToJsonElement(body).jsonObject
-            if (parsed["ok"]?.jsonPrimitive?.boolean == true) {
-                parsed["result"]?.jsonObject?.get("username")?.jsonPrimitive?.content
-            } else null
-        } catch (e: Exception) {
-            Log.w(TAG, "getBotInfo failed: ${e.message}")
-            null
-        }
-    }
+            val loginJson = loginResp.body?.string() ?: return@withContext FarmResult(name, false, "Login failed")
+            val token = json.parseToJsonElement(loginJson)
+                .jsonObject["data"]?.jsonObject?.get("access_token")?.jsonPrimitive?.content
+                ?: return@withContext FarmResult(name, false, "No token: ${loginJson.take(80)}")
 
-    private suspend fun getOrCreateChatWithBot(token: String, botUsername: String): Long? {
-        return try {
-            // Send a message to the bot to create the chat
-            val body = buildJsonObject {
-                put("chat_id", "@$botUsername")
-                put("text", "/start")
-            }.toString().toRequestBody("application/json".toMediaType())
+            val authHeader = "Bearer $token"
 
-            val resp = client.newCall(
-                Request.Builder()
-                    .url("$BASE$token/sendMessage")
-                    .post(body)
+            // Step 2: daily check-in
+            client.newCall(
+                Request.Builder().url("$base/daily/claim")
+                    .post("{}".toRequestBody(JSON_TYPE))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
                     .build()
             ).execute()
 
-            val responseBody = resp.body?.string() ?: return null
-            val parsed = json.parseToJsonElement(responseBody).jsonObject
-
-            if (parsed["ok"]?.jsonPrimitive?.boolean == true) {
-                parsed["result"]?.jsonObject
-                    ?.get("chat")?.jsonObject
-                    ?.get("id")?.jsonPrimitive?.long
-            } else {
-                // Try getting from updates if direct message failed
-                getChatIdFromUpdates(token, botUsername)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "getOrCreateChat failed for $botUsername: ${e.message}")
-            null
-        }
-    }
-
-    private suspend fun getChatIdFromUpdates(token: String, botUsername: String): Long? {
-        return try {
-            val resp = client.newCall(
-                Request.Builder().url("$BASE$token/getUpdates?limit=20").build()
-            ).execute()
-            val body = resp.body?.string() ?: return null
-            val parsed = json.parseToJsonElement(body).jsonObject
-            val updates = parsed["result"]?.jsonArray ?: return null
-
-            for (update in updates) {
-                val msg = update.jsonObject["message"]?.jsonObject ?: continue
-                val fromUsername = msg["from"]?.jsonObject?.get("username")?.jsonPrimitive?.content
-                if (fromUsername?.equals(botUsername, ignoreCase = true) == true) {
-                    return msg["chat"]?.jsonObject?.get("id")?.jsonPrimitive?.long
-                }
-            }
-            null
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private suspend fun sendMessage(token: String, chatId: Long, text: String): Boolean {
-        return try {
-            val body = buildJsonObject {
-                put("chat_id", chatId)
-                put("text", text)
-            }.toString().toRequestBody("application/json".toMediaType())
-
-            val resp = client.newCall(
-                Request.Builder()
-                    .url("$BASE$token/sendMessage")
-                    .post(body)
+            // Step 3: claim farm
+            client.newCall(
+                Request.Builder().url("$base/farm/claim")
+                    .post("{}".toRequestBody(JSON_TYPE))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
                     .build()
             ).execute()
 
-            val parsed = json.parseToJsonElement(resp.body?.string() ?: "{}").jsonObject
-            parsed["ok"]?.jsonPrimitive?.boolean == true
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    private suspend fun sendMessageAndGetReply(token: String, chatId: Long, text: String): String? {
-        return try {
-            // Get update offset before sending
-            val beforeUpdates = getLatestUpdateId(token)
-
-            // Send the command
-            sendMessage(token, chatId, text)
-
-            // Wait for reply
-            delay(3000)
-
-            // Get new updates
-            val url = if (beforeUpdates != null)
-                "$BASE$token/getUpdates?offset=${beforeUpdates + 1}&limit=10&timeout=5"
-            else
-                "$BASE$token/getUpdates?limit=10&timeout=5"
-
-            val resp = client.newCall(Request.Builder().url(url).build()).execute()
-            val body = resp.body?.string() ?: return null
-            val parsed = json.parseToJsonElement(body).jsonObject
-            val updates = parsed["result"]?.jsonArray ?: return null
-
-            // Find reply from the bot we messaged
-            for (update in updates.reversed()) {
-                val msg = update.jsonObject["message"]?.jsonObject ?: continue
-                val msgChatId = msg["chat"]?.jsonObject?.get("id")?.jsonPrimitive?.long
-                if (msgChatId == chatId) {
-                    return msg["text"]?.jsonPrimitive?.content
-                }
-            }
-            null
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private suspend fun getLatestUpdateId(token: String): Long? {
-        return try {
-            val resp = client.newCall(
-                Request.Builder().url("$BASE$token/getUpdates?limit=1").build()
+            // Step 4: start next farm
+            client.newCall(
+                Request.Builder().url("$base/farm/start")
+                    .post("{}".toRequestBody(JSON_TYPE))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
+                    .build()
             ).execute()
-            val body = resp.body?.string() ?: return null
-            val parsed = json.parseToJsonElement(body).jsonObject
-            parsed["result"]?.jsonArray?.lastOrNull()
-                ?.jsonObject?.get("update_id")?.jsonPrimitive?.long
-        } catch (e: Exception) {
-            null
+
+            // Step 5: get balance
+            val balResp = client.newCall(
+                Request.Builder().url("$base/user/balance")
+                    .post("{}".toRequestBody(JSON_TYPE))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+            val balJson = balResp.body?.string() ?: ""
+            val balance = json.parseToJsonElement(balJson)
+                .jsonObject["data"]?.jsonObject?.get("available_balance")?.jsonPrimitive?.content ?: "?"
+
+            FarmResult(name, true, "✅ Claimed + farming started", "Balance: $balance TOMATO")
         }
-    }
+
+    // ── PAWS ───────────────────────────────────────────────────────────────────
+    private suspend fun farmPaws(initData: String, name: String): FarmResult =
+        withContext(Dispatchers.IO) {
+            val base = "https://api.paws.community/v1"
+
+            // Auth
+            val authBody = """{"data":"$initData","referralCode":"pHJCKGh4"}""".toRequestBody(JSON_TYPE)
+            val authResp = client.newCall(
+                Request.Builder().url("$base/user/auth")
+                    .post(authBody)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+            val authJson = authResp.body?.string() ?: return@withContext FarmResult(name, false, "Auth failed")
+            val token = json.parseToJsonElement(authJson)
+                .jsonObject["data"]?.jsonArray?.get(0)?.jsonPrimitive?.content
+                ?: return@withContext FarmResult(name, false, "No token: ${authJson.take(80)}")
+
+            val authHeader = "Bearer $token"
+
+            // Claim daily
+            val claimResp = client.newCall(
+                Request.Builder().url("$base/quests/claim")
+                    .post("""{"questId":"daily"}""".toRequestBody(JSON_TYPE))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+            val claimOk = claimResp.isSuccessful
+
+            // Get balance
+            val userResp = client.newCall(
+                Request.Builder().url("$base/user")
+                    .get()
+                    .header("Authorization", authHeader)
+                    .build()
+            ).execute()
+            val userJson = userResp.body?.string() ?: ""
+            val balance = try {
+                json.parseToJsonElement(userJson)
+                    .jsonObject["data"]?.jsonObject?.get("gameData")
+                    ?.jsonObject?.get("balance")?.jsonPrimitive?.content ?: "?"
+            } catch (e: Exception) { "?" }
+
+            FarmResult(name, claimOk, if (claimOk) "✅ Daily claimed" else "Already claimed today", "Balance: $balance PAWS")
+        }
+
+    // ── Boinker ────────────────────────────────────────────────────────────────
+    private suspend fun farmBoinker(initData: String, name: String): FarmResult =
+        withContext(Dispatchers.IO) {
+            val base = "https://boink.astronomica.io/public"
+
+            val loginBody = """{"telegramInitData":"$initData"}""".toRequestBody(JSON_TYPE)
+            val loginResp = client.newCall(
+                Request.Builder().url("$base/users/loginByTelegram?p=android")
+                    .post(loginBody)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+            val loginJson = loginResp.body?.string() ?: return@withContext FarmResult(name, false, "Login failed")
+            val token = json.parseToJsonElement(loginJson)
+                .jsonObject["token"]?.jsonPrimitive?.content
+                ?: return@withContext FarmResult(name, false, "No token: ${loginJson.take(80)}")
+
+            val authHeader = "Bearer $token"
+
+            // Tap (boing)
+            val tapBody = """{"nonce":${System.currentTimeMillis()}}""".toRequestBody(JSON_TYPE)
+            val tapResp = client.newCall(
+                Request.Builder().url("$base/boinkers/boing")
+                    .post(tapBody)
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+
+            val tapJson = tapResp.body?.string() ?: ""
+            val reward = try {
+                json.parseToJsonElement(tapJson)
+                    .jsonObject["pointsGained"]?.jsonPrimitive?.content ?: "?"
+            } catch (e: Exception) { "?" }
+
+            FarmResult(name, tapResp.isSuccessful, if (tapResp.isSuccessful) "✅ Tapped!" else "Tap failed", "Gained: $reward pts")
+        }
+
+    // ── Major ──────────────────────────────────────────────────────────────────
+    private suspend fun farmMajor(initData: String, name: String): FarmResult =
+        withContext(Dispatchers.IO) {
+            val base = "https://major.bot/api"
+
+            val authBody = """{"init_data":"$initData"}""".toRequestBody(JSON_TYPE)
+            val authResp = client.newCall(
+                Request.Builder().url("$base/auth/tg/")
+                    .post(authBody)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+            val authJson = authResp.body?.string() ?: return@withContext FarmResult(name, false, "Auth failed")
+            val token = json.parseToJsonElement(authJson)
+                .jsonObject["access_token"]?.jsonPrimitive?.content
+                ?: return@withContext FarmResult(name, false, "No token: ${authJson.take(80)}")
+
+            val authHeader = "Bearer $token"
+
+            // Daily visit
+            val visitResp = client.newCall(
+                Request.Builder().url("$base/user-visits/visit/")
+                    .post("{}".toRequestBody(JSON_TYPE))
+                    .header("Authorization", authHeader)
+                    .header("Content-Type", "application/json")
+                    .build()
+            ).execute()
+
+            val visitJson = visitResp.body?.string() ?: ""
+            val streak = try {
+                json.parseToJsonElement(visitJson)
+                    .jsonObject["streak"]?.jsonPrimitive?.content ?: "?"
+            } catch (e: Exception) { "?" }
+
+            FarmResult(name, visitResp.isSuccessful,
+                if (visitResp.isSuccessful) "✅ Daily visit done" else "Already visited",
+                "Streak: $streak days")
+        }
+
+    // ── NotPixel ───────────────────────────────────────────────────────────────
+    private suspend fun farmNotPixel(initData: String, name: String): FarmResult =
+        withContext(Dispatchers.IO) {
+            val base = "https://notpx.app/api/v1"
+
+            val authHeader = "initData $initData"
+
+            // Get status
+            val statusResp = client.newCall(
+                Request.Builder().url("$base/mining/status")
+                    .get()
+                    .header("Authorization", authHeader)
+                    .build()
+            ).execute()
+            val statusJson = statusResp.body?.string() ?: return@withContext FarmResult(name, false, "Status failed")
+
+            val balance = try {
+                json.parseToJsonElement(statusJson)
+                    .jsonObject["userBalance"]?.jsonPrimitive?.content ?: "?"
+            } catch (e: Exception) { "?" }
+
+            // Claim mining rewards
+            val claimResp = client.newCall(
+                Request.Builder().url("$base/mining/claim")
+                    .get()
+                    .header("Authorization", authHeader)
+                    .build()
+            ).execute()
+            val claimJson = claimResp.body?.string() ?: ""
+            val claimed = try {
+                json.parseToJsonElement(claimJson)
+                    .jsonObject["claimed"]?.jsonPrimitive?.content ?: "0"
+            } catch (e: Exception) { "0" }
+
+            FarmResult(name, claimResp.isSuccessful,
+                if (claimResp.isSuccessful) "✅ Mining claimed" else "Nothing to claim",
+                "Claimed: $claimed | Balance: $balance PX")
+        }
 }

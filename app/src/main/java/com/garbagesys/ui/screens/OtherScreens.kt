@@ -17,6 +17,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.*
 import androidx.compose.ui.unit.*
 import com.garbagesys.data.models.*
+import com.garbagesys.engine.bootstrap.TelegramFarmer
 import com.garbagesys.ui.components.*
 import com.garbagesys.ui.theme.*
 import com.garbagesys.ui.viewmodel.MainViewModel
@@ -252,6 +253,14 @@ fun SettingsScreen(vm: MainViewModel) {
     var botTokenInput by remember { mutableStateOf(vm.getTelegramBotToken()) }
     var botTokenVisible by remember { mutableStateOf(false) }
     var botTokenSaved by remember { mutableStateOf(vm.hasTelegramBotToken()) }
+    // initData inputs per bot — map of botKey -> current input text
+    val initDataInputs = remember {
+        mutableStateMapOf<String, String>().also { map ->
+            TelegramFarmer.FARM_BOTS.forEach { bot ->
+                map[bot.key] = if (vm.hasBotInitData(bot.key)) "••••••" else ""
+            }
+        }
+    }
 
     LazyColumn(modifier = Modifier.fillMaxSize().background(BgDeep), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Settings", style = MaterialTheme.typography.displayMedium.copy(fontFamily = ParafinaFamily, fontWeight = FontWeight.Black), color = GreenPrimary) }
@@ -278,48 +287,79 @@ fun SettingsScreen(vm: MainViewModel) {
         // Telegram Bootstrap
         item {
             GsCard {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("📱", style = MaterialTheme.typography.bodyLarge)
                         GsLabel("TELEGRAM FARMING BOOTSTRAP")
                     }
-                    GsBodyText("Auto-farms 8 Telegram mini-app games every cycle. Earns real tokens to bootstrap trading wallet from zero.")
+                    GsBodyText("Farms 5 Telegram mini-app games every cycle. Pure HTTP — no Python, no Termux needed.")
+
+                    val anyConfigured = TelegramFarmer.FARM_BOTS.any { vm.hasBotInitData(it.key) }
                     Surface(
-                        color = if (botTokenSaved) ProfitGreen.copy(alpha = 0.1f) else WarnAmber.copy(alpha = 0.1f),
+                        color = if (anyConfigured) ProfitGreen.copy(alpha = 0.1f) else WarnAmber.copy(alpha = 0.1f),
                         shape = MaterialTheme.shapes.small
                     ) {
                         Text(
-                            if (botTokenSaved) "✅ Bot token configured — farming active" else "⚠️ No bot token — add below to activate",
+                            if (anyConfigured) "✅ ${TelegramFarmer.FARM_BOTS.count { vm.hasBotInitData(it.key) }}/${TelegramFarmer.FARM_BOTS.size} bots configured"
+                            else "⚠️ No bots configured — follow setup below",
                             style = MaterialTheme.typography.bodySmall,
-                            color = if (botTokenSaved) ProfitGreen else WarnAmber,
+                            color = if (anyConfigured) ProfitGreen else WarnAmber,
                             modifier = Modifier.padding(8.dp)
                         )
                     }
+
                     GsDivider()
-                    Text("1. Open Telegram → search @BotFather\n2. Send /newbot → follow steps\n3. Copy the token (looks like 7123456:AAH...)\n4. Paste below and save",
-                        style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                    GsDivider()
-                    OutlinedTextField(
-                        value = botTokenInput,
-                        onValueChange = { botTokenInput = it },
-                        label = { Text("Bot Token (from @BotFather)", color = TextMuted) },
-                        modifier = Modifier.fillMaxWidth(),
-                        visualTransformation = if (botTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { botTokenVisible = !botTokenVisible }) {
-                                Icon(if (botTokenVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility, null, tint = TextMuted)
-                            }
-                        },
-                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = GreenPrimary, unfocusedBorderColor = BorderColor, focusedTextColor = TextPrimary, unfocusedTextColor = TextPrimary, cursorColor = GreenPrimary),
-                        maxLines = 2
+                    GsLabel("HOW TO GET YOUR QUERY STRING")
+                    Text(
+                        "For each bot below:\n1. Open the link in Telegram → mini-app launches\n2. On any PC browser go to web.telegram.org\n3. Open same bot → Open App\n4. Press F12 → Network tab → find any request\n5. Copy the Authorization header value (query_id=...&user=...&hash=...)\n6. Paste it below for that bot",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
                     )
-                    GsButton("Save Bot Token", onClick = {
-                        vm.saveTelegramBotToken(botTokenInput)
-                        botTokenSaved = botTokenInput.isNotEmpty()
-                    })
-                    if (botTokenSaved) {
-                        Text("Farming: TapSwap • Tomarket • HereWallet • Pixelverse • Boinker • Major • MemeFi • Catizen",
-                            style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+
+                    GsDivider()
+
+                    TelegramFarmer.FARM_BOTS.forEach { bot ->
+                        val configured = vm.hasBotInitData(bot.key)
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(bot.displayName, style = MaterialTheme.typography.bodyMedium, color = TextPrimary)
+                                Surface(
+                                    color = if (configured) ProfitGreen.copy(alpha = 0.15f) else BgCard,
+                                    shape = MaterialTheme.shapes.small
+                                ) {
+                                    Text(
+                                        if (configured) "✅ Active" else "Not set",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (configured) ProfitGreen else TextMuted,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            OutlinedTextField(
+                                value = initDataInputs[bot.key] ?: "",
+                                onValueChange = { initDataInputs[bot.key] = it },
+                                label = { Text("query_id=AA...&user=...&auth_date=...&hash=...", color = TextMuted, style = MaterialTheme.typography.labelSmall) },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = GreenPrimary, unfocusedBorderColor = BorderColor,
+                                    focusedTextColor = TextPrimary, unfocusedTextColor = TextPrimary, cursorColor = GreenPrimary
+                                ),
+                                maxLines = 2,
+                                textStyle = MaterialTheme.typography.bodySmall
+                            )
+                            GsButton("Save ${bot.displayName}", onClick = {
+                                val v = initDataInputs[bot.key] ?: ""
+                                if (v.isNotEmpty() && v != "••••••") {
+                                    vm.saveBotInitData(bot.key, v)
+                                    initDataInputs[bot.key] = "••••••"
+                                }
+                            })
+                        }
+                        if (bot != TelegramFarmer.FARM_BOTS.last()) GsDivider()
                     }
                 }
             }
